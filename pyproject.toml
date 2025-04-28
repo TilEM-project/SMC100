@@ -1,0 +1,18 @@
+[project]
+name = "SMC100"
+version = "0.1.0"
+authors = [
+    { name="Derrick Brittain", email="derrickb@alleninstitute.org" }
+]
+dependencies = [
+    "pyserial",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
