@@ -176,7 +176,7 @@ class SMC100StateError(SMC100Error):
 
 
 MAX_WAIT_TIME_SEC = 60
-COMMAND_WAIT_TIME_SEC = 0.9
+COMMAND_WAIT_TIME_SEC = 0.5
 
 
 class SMC100:
@@ -482,14 +482,17 @@ class SMC100:
                 self._sleepfunc(0.1)
                 continue
 
-    def home(self, wait: bool = False) -> None:
+    def home(self, wait: bool = False, move_to_origin: bool = False) -> None:
         """
         Home the controller and optionally wait for completion.
 
         Args:
             wait: Wait for homing to complete if True
+            move_to_origin: If True, move_absolute_um(0) after homing.
+                            Useful when HT=1 is used to define current position as zero.
         """
         cmd = f"{self._smcID}{SMC100Command.HOME.cmd}"
+        self._logger.info(f"Executing home command: {cmd}")
         self._send_command(cmd, expect_response=False)
 
         if wait:
@@ -497,8 +500,15 @@ class SMC100:
                 SMC100States.STATES["32"],  # READY from HOMING
                 SMC100States.STATES["33"],  # READY from MOVING
             ]
-        self._wait_for_states(ready_states)
-        self.move_absolute_um(0, wait=True)
+            self._logger.info("Waiting for homing to complete...")
+            reached_state = self._wait_for_states(ready_states)
+            self._logger.info(f"Homing complete, reached state: {reached_state.code}")
+
+            if move_to_origin:
+                self._logger.info("Moving to position 0 after homing.")
+                self.move_absolute_um(0, wait=True)
+            else:
+                self._logger.info("Skipping move to zero after HT=1 homing.")
 
     def _wait_for_states(
         self,
