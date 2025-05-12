@@ -1,571 +1,951 @@
 import json
+import os
 import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-
-from smc100.controller import SMC100, SMC100Command
+import serial
+from smc100.controller import (
+    SMC100,
+    SMC100Command,
+    SMC100CommunicationError,
+    SMC100StateError,
+    SMC100TimeoutError,
+)
 
 
 class LimitFinderApp:
-    def __init__(self, root):
-        self.init(root)
 
-    def initialize_stage(self) -> None:
-        """
-        Full power-on setup:
-         1) Enter CONFIGURATION (PW1)
-         2) Load & save stage EEPROM parameters (ZX2)
-         3) Exit CONFIGURATION (PW0)
-         4) Home the stage (OR), waiting for it to finish
-        """
-        try:
-            self.status_var.set("Initializing…")
-            # 1) enter config
-            self.controller.execute_command(SMC100Command.ENTER_CONFIGURATION, 1)
-            # 2) load stage params
-            self.controller.execute_command(SMC100Command.STAGE_PARAMETERS, 1)
-            # 3) exit config (can take →10 s)
-            self.controller.execute_command(SMC100Command.ENTER_CONFIGURATION, 0)
-
-            # wait for PW0 to finish
-            start = time.time()
-            while True:
-                _, st = self.controller.get_status(silent=True)
-                if st != "14":
-                    break
-                if time.time() - start > 12:
-                    raise RuntimeError("Configuration exit timeout")
-                time.sleep(0.1)
-
-            # 4) set home search to “current position” (HT=1)
-            self.controller.execute_command(SMC100Command.HOME_SEARCH_TYPE, 1)
-
-            # 5) home and wait for READY
-            self.controller.home(wait=True)
-
-            pos = self.controller.get_position_mm()
-            self.position_var.set(f"{pos:.3f} mm")
-            self.status_var.set("Ready")
-        except Exception as e:
-            messagebox.showerror("Initialization Error", f"Stage init failed:\n{e}")
-            self.status_var.set("Init failed")
-
-    def init(self, root: tk.Tk) -> None:
+    def __init__(self, root: tk.Tk):
+        """Initialize the application."""
         self.root = root
-        self.root.title("SMC100 Limit Finder")
-        self.root.geometry("800x600")
+        self.root.title("SMC100 Stage Control")
+        self.root.geometry("850x650")
+
         self.controller = None
-        self.position_var = tk.StringVar(value="Not connected")
-        self.jog_speed = tk.DoubleVar(value=1.0)
-        self.jog_distance = tk.DoubleVar(value=0.1)
-        self.status_var = tk.StringVar(value="Not connected")
-        self.neg_limit_var = tk.StringVar(value="Not set")
-        self.pos_limit_var = tk.StringVar(value="Not set")
         self.connected = False
-        self.stop_thread = False
+        self.port_var = tk.StringVar(value="/dev/ttyUSB0")
+        self.smc_id_var = tk.StringVar(value="1")
+
+        self.position_var = tk.StringVar(value="N/A")
+        self.status_var = tk.StringVar(value="Not Connected")
         self.update_thread = None
+        self.stop_thread = False
+
+        self.move_speed_var = tk.DoubleVar(value=1.0)
+        self.move_distance_var = tk.DoubleVar(value=0.1)
+
+        self.neg_limit_var = tk.StringVar(value="N/A")
+        self.pos_limit_var = tk.StringVar(value="N/A")
+
+        self.virtual_config_file = "virtual_limits_config.json"
+        self.virtual_center_var = tk.DoubleVar(value=12.0)
+        self.virtual_range_var = tk.DoubleVar(value=2.5)
+        self.virtual_center_abs = None
+        self.virtual_range = None
+        self.virtual_neg_limit_abs = None
+        self.virtual_pos_limit_abs = None
+        self.software_limits_active = False
+
+        self.home_type_var = tk.StringVar(value="1")
+
         self.create_widgets()
+        self.load_virtual_limits()
+        self._configure_resizing()
+
+    def _configure_resizing(self):
+        """Configure row/column weights for main window resizing."""
+        self.root.columnconfigure(0, weight=1)
+        self.root.columnconfigure(1, weight=3)
+        self.root.rowconfigure(0, weight=1)
+
+        self.left_frame.columnconfigure(0, weight=1)
+        self.left_frame.rowconfigure(0, weight=0)
+        self.left_frame.rowconfigure(1, weight=0)
+        self.left_frame.rowconfigure(2, weight=1)
+        self.left_frame.rowconfigure(3, weight=0)
+        self.left_frame.rowconfigure(4, weight=0)
+
+        self.right_frame.columnconfigure(0, weight=1)
+        self.right_frame.rowconfigure(0, weight=1)
 
     def create_widgets(self):
-        left_frame = ttk.Frame(self.root)
-        left_frame.pack(side="left", fill="both", expand=True, padx=10, pady=10)
+        """Create and layout GUI widgets."""
+        self.left_frame = ttk.Frame(self.root)
+        self.left_frame.grid(row=0, column=0, padx=(10, 5), pady=10, sticky="nsew")
 
-        right_frame = ttk.Frame(self.root)
-        right_frame.pack(side="right", fill="both", expand=True, padx=10, pady=10)
+        self.right_frame = ttk.Frame(self.root)
+        self.right_frame.grid(row=0, column=1, padx=(5, 10), pady=10, sticky="nsew")
 
-        conn_frame = ttk.LabelFrame(left_frame, text="Connection")
-        conn_frame.pack(padx=5, pady=5, fill="x")
+        current_row = 0
 
-        conn_grid = ttk.Frame(conn_frame)
-        conn_grid.pack(padx=5, pady=5, fill="x")
+        conn_frame = ttk.LabelFrame(self.left_frame, text="Connection")
+        conn_frame.grid(row=current_row, column=0, sticky="ew", padx=5, pady=5)
 
-        ttk.Label(conn_grid, text="Port:").grid(
+        conn_frame.columnconfigure(1, weight=1)
+        conn_frame.grid()
+        current_row += 1
+
+        ttk.Label(conn_frame, text="Port:").grid(
             row=0, column=0, padx=5, pady=5, sticky="w"
         )
-        self.port_entry = ttk.Entry(conn_grid)
-        self.port_entry.insert(0, "/dev/ttyUSB0")
+        self.port_entry = ttk.Entry(conn_frame, textvariable=self.port_var)
         self.port_entry.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
 
-        ttk.Label(conn_grid, text="SMC ID:").grid(
+        ttk.Label(conn_frame, text="SMC ID:").grid(
             row=1, column=0, padx=5, pady=5, sticky="w"
         )
-        self.smc_id_entry = ttk.Entry(conn_grid, width=5)
-        self.smc_id_entry.insert(0, "1")
+        self.smc_id_entry = ttk.Entry(conn_frame, textvariable=self.smc_id_var, width=5)
         self.smc_id_entry.grid(row=1, column=1, padx=5, pady=5, sticky="w")
 
+        self.move_to_origin_var = tk.BooleanVar(value=False)
+        self.move_to_origin_cb = ttk.Checkbutton(
+            conn_frame,
+            text="Move to Origin on Connect",
+            variable=self.move_to_origin_var,
+        )
+        self.move_to_origin_cb.grid(
+            row=2, column=0, columnspan=2, padx=5, pady=5, sticky="w"
+        )
+
         self.connect_btn = ttk.Button(
-            conn_grid, text="Connect", command=self.toggle_connection
+            conn_frame, text="Connect", command=self.toggle_connection
         )
         self.connect_btn.grid(
-            row=2, column=0, columnspan=2, padx=5, pady=5, sticky="ew"
+            row=3, column=0, columnspan=2, padx=5, pady=5, sticky="ew"
         )
 
-        status_frame = ttk.LabelFrame(left_frame, text="Status")
-        status_frame.pack(padx=5, pady=5, fill="x")
-
-        status_grid = ttk.Frame(status_frame)
-        status_grid.pack(padx=5, pady=5, fill="x")
+        status_frame = ttk.LabelFrame(self.left_frame, text="Status")
+        status_frame.grid(row=current_row, column=0, sticky="ew", padx=5, pady=5)
+        status_frame.columnconfigure(1, weight=1)
+        current_row += 1
 
         ttk.Label(
-            status_grid, text="Position:", font=("TkDefaultFont", 10, "bold")
+            status_frame, text="Position:", font=("TkDefaultFont", 10, "bold")
         ).grid(row=0, column=0, padx=5, pady=5, sticky="w")
-        ttk.Label(status_grid, textvariable=self.position_var, width=15).grid(
+        ttk.Label(status_frame, textvariable=self.position_var).grid(
             row=0, column=1, padx=5, pady=5, sticky="w"
         )
 
-        ttk.Label(status_grid, text="Status:", font=("TkDefaultFont", 10, "bold")).grid(
-            row=1, column=0, padx=5, pady=5, sticky="w"
-        )
-        ttk.Label(status_grid, textvariable=self.status_var, width=25).grid(
+        ttk.Label(
+            status_frame, text="Status:", font=("TkDefaultFont", 10, "bold")
+        ).grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        ttk.Label(status_frame, textvariable=self.status_var).grid(
             row=1, column=1, padx=5, pady=5, sticky="w"
         )
 
-        config_frame = ttk.LabelFrame(left_frame, text="Configuration")
-        config_frame.pack(padx=5, pady=5, fill="x")
-        config_grid = ttk.Frame(config_frame)
-        config_grid.pack(padx=5, pady=5, fill="x")
+        limits_frame = ttk.LabelFrame(
+            self.left_frame, text="Controller & Virtual Limits"
+        )
+        limits_frame.grid(row=current_row, column=0, sticky="nsew", padx=5, pady=5)
+        limits_frame.columnconfigure(1, weight=1)
+        current_row += 1
+
+        ttk.Label(limits_frame, text="Ctrl Neg Lim:").grid(
+            row=0, column=0, padx=5, pady=2, sticky="w"
+        )
+        ttk.Label(limits_frame, textvariable=self.neg_limit_var).grid(
+            row=0, column=1, padx=5, pady=2, sticky="ew"
+        )
+
+        ttk.Label(limits_frame, text="Ctrl Pos Lim:").grid(
+            row=1, column=0, padx=5, pady=2, sticky="w"
+        )
+        ttk.Label(limits_frame, textvariable=self.pos_limit_var).grid(
+            row=1, column=1, padx=5, pady=2, sticky="ew"
+        )
+
+        ttk.Separator(limits_frame, orient="horizontal").grid(
+            row=2, column=0, columnspan=2, sticky="ew", pady=5
+        )
+
+        ttk.Label(limits_frame, text="Virtual Center (mm):").grid(
+            row=3, column=0, padx=5, pady=2, sticky="w"
+        )
+        self.virtual_center_entry = ttk.Entry(
+            limits_frame,
+            textvariable=self.virtual_center_var,
+            width=10,
+            state="disabled",
+        )
+        self.virtual_center_entry.grid(row=3, column=1, padx=5, pady=2, sticky="w")
+
+        ttk.Label(limits_frame, text="Virtual Range (+/- mm):").grid(
+            row=4, column=0, padx=5, pady=2, sticky="w"
+        )
+        self.virtual_range_entry = ttk.Entry(
+            limits_frame,
+            textvariable=self.virtual_range_var,
+            width=10,
+            state="disabled",
+        )
+        self.virtual_range_entry.grid(row=4, column=1, padx=5, pady=2, sticky="w")
+
+        self.set_virtual_limits_btn = ttk.Button(
+            limits_frame,
+            text="Activate & Save Virtual Limits",
+            command=self.set_and_save_virtual_limits,
+            state="disabled",  # Enable on connect
+        )
+        self.set_virtual_limits_btn.grid(
+            row=5, column=0, columnspan=2, padx=5, pady=5, sticky="ew"
+        )
+
+        config_frame = ttk.LabelFrame(self.left_frame, text="Controller Configuration")
+        config_frame.grid(row=current_row, column=0, sticky="ew", padx=5, pady=5)
+        config_frame.columnconfigure(0, weight=1)
+        current_row += 1
+
         self.reset_config_btn = ttk.Button(
-            config_grid,
-            text="Reset to Defaults",
+            config_frame,
+            text="Reset Controller to Defaults",
             command=self.reset_to_defaults,
             state="disabled",
         )
         self.reset_config_btn.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
+
+        save_load_frame = ttk.Frame(config_frame)
+        save_load_frame.grid(row=1, column=0, sticky="ew")
+        save_load_frame.columnconfigure(0, weight=1)
+        save_load_frame.columnconfigure(1, weight=1)
+
         self.save_config_btn = ttk.Button(
-            config_grid,
-            text="Save Configuration",
+            save_load_frame,
+            text="Save Ctrlr Config",
             command=self.save_configuration,
             state="disabled",
         )
-        self.save_config_btn.grid(row=1, column=0, padx=5, pady=5, sticky="ew")
+        self.save_config_btn.grid(row=0, column=0, padx=(5, 2), pady=5, sticky="ew")
+
         self.load_config_btn = ttk.Button(
-            config_grid,
-            text="Load Configuration",
+            save_load_frame,
+            text="Load Ctrlr Config",
             command=self.load_configuration,
             state="disabled",
         )
-        self.load_config_btn.grid(row=2, column=0, padx=5, pady=5, sticky="ew")
+        self.load_config_btn.grid(row=0, column=1, padx=(2, 5), pady=5, sticky="ew")
 
-        limits_frame = ttk.LabelFrame(left_frame, text="Limits")
-        limits_frame.pack(padx=5, pady=5, fill="both", expand=True)
+        home_frame = ttk.LabelFrame(self.left_frame, text="Home Position")
+        home_frame.grid(row=current_row, column=0, sticky="ew", padx=5, pady=5)
+        home_frame.columnconfigure(1, weight=1)
+        current_row += 1
 
-        limits_grid = ttk.Frame(limits_frame)
-        limits_grid.pack(padx=5, pady=5, fill="both", expand=True)
-
-        ttk.Label(
-            limits_grid, text="Negative Limit:", font=("TkDefaultFont", 10, "bold")
-        ).grid(row=0, column=0, padx=5, pady=5, sticky="w")
-        ttk.Label(limits_grid, textvariable=self.neg_limit_var, width=15).grid(
-            row=0, column=1, padx=5, pady=5, sticky="w"
+        ttk.Label(home_frame, text="Home Type:").grid(
+            row=0, column=0, padx=5, pady=5, sticky="w"
         )
-
-        self.set_neg_btn = ttk.Button(
-            limits_grid,
-            text="Set Current as Negative Limit",
-            command=self.set_negative_limit,
-            state="disabled",
+        self.home_type_combo = ttk.Combobox(
+            home_frame,
+            textvariable=self.home_type_var,
+            width=30,
+            state="readonly",
+            values=(
+                "0 - Use MZ switch and encoder index",
+                "1 - Use current position as HOME",  # Not reliable for zeroing!
+                "2 - Use MZ switch only",
+                "3 - Use EoR- switch and encoder index",
+                "4 - Use EoR- switch only",
+            ),
         )
-        self.set_neg_btn.grid(
-            row=1, column=0, columnspan=2, padx=5, pady=5, sticky="ew"
+        # Find index for HT=3 (default recommended hardware home)
+        default_ht_index = 3  # Default to HT=3
+        for i, val in enumerate(self.home_type_combo["values"]):
+            if val.startswith("3"):
+                default_ht_index = i
+                break
+        self.home_type_combo.current(default_ht_index)
+        self.home_type_combo.grid(
+            row=0, column=1, columnspan=2, padx=5, pady=5, sticky="ew"
         )
-
-        ttk.Separator(limits_grid, orient="horizontal").grid(
-            row=2, column=0, columnspan=2, sticky="ew", pady=10
-        )
-
-        vacuum_frame = ttk.LabelFrame(
-            self.root, text="⚠️ VACUUM CHAMBER CONFIGURATION ⚠️"
-        )
-        vacuum_frame.pack(padx=10, pady=10, fill="x")
-        ttk.Label(
-            vacuum_frame,
-            text="Configure BEFORE placing in vacuum chamber:",
-            font=("TkDefaultFont", 10, "bold"),
-        ).pack(padx=5, pady=2)
-
-        self.vacuum_config_btn = ttk.Button(
-            vacuum_frame,
-            text="Set 12.5mm as Home with Travel Limits",
-            command=self.configure_for_vacuum_chamber,
-            state="disabled",
-        )
-        self.vacuum_config_btn.pack(padx=5, pady=5, fill="x")
-
-        ttk.Label(
-            vacuum_frame,
-            text="⚠️ After configuration, HOME will be DISABLED",
-            foreground="red",
-        ).pack(padx=5, pady=2)
-
-        ttk.Label(
-            limits_grid, text="Positive Limit:", font=("TkDefaultFont", 10, "bold")
-        ).grid(row=3, column=0, padx=5, pady=5, sticky="w")
-        ttk.Label(limits_grid, textvariable=self.pos_limit_var, width=15).grid(
-            row=3, column=1, padx=5, pady=5, sticky="w"
-        )
-
-        self.set_pos_btn = ttk.Button(
-            limits_grid,
-            text="Set Current as Positive Limit",
-            command=self.set_positive_limit,
-            state="disabled",
-        )
-        self.set_pos_btn.grid(
-            row=4, column=0, columnspan=2, padx=5, pady=5, sticky="ew"
-        )
-
-        ttk.Separator(limits_grid, orient="horizontal").grid(
-            row=5, column=0, columnspan=2, sticky="ew", pady=10
-        )
-
-        self.apply_temp_btn = ttk.Button(
-            limits_grid,
-            text="Apply Limits Temporarily",
-            command=self.apply_limits_temp,
-            state="disabled",
-        )
-        self.apply_temp_btn.grid(
-            row=6, column=0, columnspan=2, padx=5, pady=5, sticky="ew"
-        )
-
-        self.apply_perm_btn = ttk.Button(
-            limits_grid,
-            text="Save Limits Permanently",
-            command=self.apply_limits_perm,
-            state="disabled",
-        )
-        self.apply_perm_btn.grid(
-            row=7, column=0, columnspan=2, padx=5, pady=5, sticky="ew"
-        )
-
-        home_frame = ttk.LabelFrame(left_frame, text="Home Position")
-        home_frame.pack(padx=5, pady=5, fill="x")
-
-        # home_frame = ttk.LabelFrame(self.root, text="Home Position")
-        # home_frame.pack(padx=10, pady=5, fill="x")
-
-        self.home_type_var = tk.StringVar(value="1")
-        ttk.Label(home_frame, text="Home Type:").grid(row=0, column=0, padx=5, pady=5)
-        home_type_combo = ttk.Combobox(
-            home_frame, textvariable=self.home_type_var, width=30, state="readonly"
-        )
-        home_type_combo["values"] = (
-            "0 - Use MZ switch and encoder index",
-            "1 - Use current position as HOME",
-            "2 - Use MZ switch only",
-            "3 - Use EoR- switch and encoder index",
-            "4 - Use EoR- switch only",
-        )
-        home_type_combo.current(1)
-        home_type_combo.grid(row=0, column=1, columnspan=2, padx=5, pady=5, sticky="w")
 
         self.set_home_type_btn = ttk.Button(
             home_frame,
-            text="Set Home Type",
+            text="Set Ctrlr Home Type",
             command=self.set_home_type,
             state="disabled",
         )
-        self.set_home_type_btn.grid(row=1, column=0, padx=5, pady=5)
+        self.set_home_type_btn.grid(row=1, column=0, padx=5, pady=5, sticky="ew")
 
         self.execute_home_btn = ttk.Button(
-            home_frame, text="Execute Home", command=self.execute_home, state="disabled"
+            home_frame,
+            text="Execute Ctrlr Home",
+            command=self.execute_home,
+            state="disabled",
         )
-        self.execute_home_btn.grid(row=1, column=1, padx=5, pady=5)
+        self.execute_home_btn.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
 
-        jog_frame = ttk.LabelFrame(right_frame, text="Motion Control")
-        jog_frame.pack(padx=5, pady=5, fill="both", expand=True)
+        move_frame = ttk.LabelFrame(self.right_frame, text="Motion Control")
+        move_frame.pack(fill="both", expand=True)
+        move_frame.columnconfigure(0, weight=1)
 
-        params_frame = ttk.Frame(jog_frame)
-        params_frame.pack(padx=5, pady=5, fill="x")
+        params_frame = ttk.Frame(move_frame)
+        params_frame.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
+        params_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(
-            params_frame, text="Speed (mm/s):", font=("TkDefaultFont", 10, "bold")
-        ).grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        ttk.Label(params_frame, text="Speed (mm/s):").grid(
+            row=0, column=0, padx=5, pady=5, sticky="w"
+        )
         ttk.Spinbox(
             params_frame,
-            from_=0.1,
+            from_=0.01,
             to=20,
-            increment=0.1,
-            textvariable=self.jog_speed,
+            increment=0.01,
+            textvariable=self.move_speed_var,
             width=8,
         ).grid(row=0, column=1, padx=5, pady=5, sticky="w")
 
-        ttk.Label(
-            params_frame, text="Step (mm):", font=("TkDefaultFont", 10, "bold")
-        ).grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        ttk.Label(params_frame, text="Step (mm):").grid(
+            row=1, column=0, padx=5, pady=5, sticky="w"
+        )
         ttk.Spinbox(
             params_frame,
             from_=0.001,
             to=10,
             increment=0.001,
-            textvariable=self.jog_distance,
+            textvariable=self.move_distance_var,
             width=8,
         ).grid(row=1, column=1, padx=5, pady=5, sticky="w")
 
-        # Motion buttons
-        motion_frame = ttk.Frame(jog_frame)
-        motion_frame.pack(padx=5, pady=10, fill="both", expand=True)
-
-        # Step buttons
-        step_frame = ttk.LabelFrame(motion_frame, text="Step Movement")
-        step_frame.pack(padx=5, pady=5, fill="x")
-
-        step_btn_frame = ttk.Frame(step_frame)
-        step_btn_frame.pack(padx=5, pady=5, fill="x")
+        step_frame = ttk.LabelFrame(move_frame, text="Step Movement")
+        step_frame.grid(row=1, column=0, sticky="ew", padx=5, pady=10)
+        step_frame.columnconfigure(0, weight=1)
+        step_frame.columnconfigure(1, weight=1)
 
         self.step_neg_btn = ttk.Button(
-            step_btn_frame,
+            step_frame,
             text="← Step",
             command=lambda: self.step_stage(-1),
             state="disabled",
-            width=15,
         )
-        self.step_neg_btn.pack(side="left", padx=5, pady=10, expand=True)
+        self.step_neg_btn.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
 
         self.step_pos_btn = ttk.Button(
-            step_btn_frame,
+            step_frame,
             text="Step →",
             command=lambda: self.step_stage(1),
             state="disabled",
-            width=15,
         )
-        self.step_pos_btn.pack(side="right", padx=5, pady=10, expand=True)
+        self.step_pos_btn.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
 
-        jog_label_frame = ttk.LabelFrame(motion_frame, text="Continuous Movement")
-        jog_label_frame.pack(padx=5, pady=5, fill="x")
+        abs_move_frame = ttk.LabelFrame(move_frame, text="Absolute Move")
+        abs_move_frame.grid(row=2, column=0, sticky="ew", padx=5, pady=10)
+        abs_move_frame.columnconfigure(1, weight=1)
 
-        jog_btn_frame = ttk.Frame(jog_label_frame)
-        jog_btn_frame.pack(padx=5, pady=5, fill="x")
-
-        self.jog_neg_btn = ttk.Button(
-            jog_btn_frame,
-            text="← Jog",
+        ttk.Label(abs_move_frame, text="Target (mm):").grid(
+            row=0, column=0, padx=5, pady=5, sticky="w"
+        )
+        self.abs_target_entry = ttk.Entry(abs_move_frame, width=10)
+        self.abs_target_entry.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+        self.move_abs_btn = ttk.Button(
+            abs_move_frame,
+            text="Move Absolute",
+            command=self.move_absolute,
             state="disabled",
-            width=15,
         )
-        self.jog_neg_btn.pack(side="left", padx=5, pady=10, expand=True)
+        self.move_abs_btn.grid(row=0, column=2, padx=5, pady=5, sticky="e")
 
-        self.jog_pos_btn = ttk.Button(
-            jog_btn_frame,
-            text="Jog →",
+        vacuum_frame = ttk.LabelFrame(move_frame, text="⚠️ Vacuum Chamber Setup ⚠️")
+        vacuum_frame.grid(row=3, column=0, sticky="ew", padx=5, pady=10)
+        vacuum_frame.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            vacuum_frame,
+            text="Center stage at 12.5mm and activate +/- 1.0mm virtual limits.",
+            justify=tk.LEFT,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=(5, 0))
+        ttk.Label(
+            vacuum_frame,
+            text="(Requires hardware home first!)",
+            font=("TkDefaultFont", 8),
+        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 5))
+
+        self.vacuum_config_btn = ttk.Button(
+            vacuum_frame,
+            text="Run Vacuum Center & Limit Setup",
+            command=self.configure_for_vacuum_chamber,
             state="disabled",
-            width=15,
         )
-        self.jog_pos_btn.pack(side="right", padx=5, pady=10, expand=True)
-
-        self.jog_neg_btn.bind("<ButtonPress-1>", lambda e: self.on_jog_press(-1))
-        self.jog_neg_btn.bind("<ButtonRelease-1>", lambda e: self.on_jog_release())
-        self.jog_pos_btn.bind("<ButtonPress-1>", lambda e: self.on_jog_press(1))
-        self.jog_pos_btn.bind("<ButtonRelease-1>", lambda e: self.on_jog_release())
-
-        stop_frame = ttk.Frame(motion_frame)
-        stop_frame.pack(padx=5, pady=10, fill="x")
-
-        self.stop_btn = ttk.Button(
-            stop_frame,
-            text="STOP",
-            command=self.stop_motion,
-            state="disabled",
-            style="Stop.TButton",
+        self.vacuum_config_btn.grid(
+            row=2, column=0, columnspan=2, padx=5, pady=5, sticky="ew"
         )
-        self.stop_btn.pack(fill="x", padx=5, pady=5)
+
+        stop_frame = ttk.Frame(move_frame)
+        stop_frame.grid(row=4, column=0, sticky="ew", padx=5, pady=10)
+        stop_frame.columnconfigure(0, weight=1)
 
         style = ttk.Style()
         style.configure(
             "Stop.TButton", font=("TkDefaultFont", 12, "bold"), foreground="red"
         )
+        self.stop_btn = ttk.Button(
+            stop_frame,
+            text="STOP MOTION",
+            command=self.stop_motion,
+            state="disabled",
+            style="Stop.TButton",
+        )
+        self.stop_btn.pack(fill="x", expand=True, ipady=5)
 
-        self.root.geometry("800x600")
+    def _set_ui_state(self, connected: bool):
+        """Enable/disable UI elements based on connection status."""
+        state = tk.NORMAL if connected else tk.DISABLED
+        widget_groups = [
+            self.reset_config_btn,
+            self.save_config_btn,
+            self.load_config_btn,
+            self.virtual_center_entry,
+            self.virtual_range_entry,
+            self.set_virtual_limits_btn,
+            self.set_home_type_btn,
+            self.execute_home_btn,
+            self.step_neg_btn,
+            self.step_pos_btn,
+            self.stop_btn,
+            self.abs_target_entry,
+            self.move_abs_btn,
+            self.vacuum_config_btn,
+        ]
+        for widget in widget_groups:
+            widget.config(state=state)
 
-    def toggle_connection(self):
-        if not self.controller:
-            threading.Thread(target=self.connect, daemon=True).start()
+        self.virtual_center_entry.config(state=tk.NORMAL if connected else tk.DISABLED)
+        self.virtual_range_entry.config(state=tk.NORMAL if connected else tk.DISABLED)
+        self.abs_target_entry.config(state=tk.NORMAL if connected else tk.DISABLED)
+
+        self.connect_btn.config(text="Disconnect" if connected else "Connect")
+
+    def save_virtual_limits(self, filename=None):
+        """Saves current virtual limits (from internal vars) to a JSON file."""
+        if filename is None:
+            filename = self.virtual_config_file
+        if self.virtual_center_abs is not None and self.virtual_range is not None:
+            config = {
+                "virtual_center_abs": self.virtual_center_abs,
+                "virtual_range": self.virtual_range,
+            }
+            try:
+                with open(filename, "w") as f:
+                    json.dump(config, f, indent=4)
+                print(f"Virtual limits saved to {filename}")
+            except Exception as e:
+                messagebox.showerror(
+                    "Save Error", f"Failed to save virtual limits: {str(e)}"
+                )
+                print(f"Failed to save virtual limits: {e}")
         else:
-            self.disconnect()
+            print("No virtual limits set to save.")
 
-    def connect(self):
-        try:
-            port = self.port_entry.get()
-            smc_id = int(self.smc_id_entry.get())
-            self.controller = SMC100(smcID=smc_id, port=port, silent=False)
+    def load_virtual_limits(self, filename=None):
+        """Loads virtual limits from a JSON file and updates state."""
+        if filename is None:
+            filename = self.virtual_config_file
 
-            self.initialize_stage()
+        limits_loaded = False
+        if os.path.exists(filename):
+            try:
+                with open(filename, "r") as f:
+                    config = json.load(f)
 
-            pos = self.controller.get_position_mm()
-            self.position_var.set(f"{pos:.3f} mm")
+                center = config.get("virtual_center_abs")
+                range_val = config.get("virtual_range")
 
+                if (
+                    isinstance(center, (int, float))
+                    and isinstance(range_val, (int, float))
+                    and range_val > 0
+                ):
+                    self.virtual_center_abs = float(center)
+                    self.virtual_range = float(range_val)
+                    self.virtual_neg_limit_abs = (
+                        self.virtual_center_abs - self.virtual_range
+                    )
+                    self.virtual_pos_limit_abs = (
+                        self.virtual_center_abs + self.virtual_range
+                    )
+                    self.software_limits_active = True
+                    self.virtual_center_var.set(self.virtual_center_abs)
+                    self.virtual_range_var.set(self.virtual_range)
+                    limits_loaded = True
+                    print(
+                        f"Loaded virtual limits from {filename}: Center={self.virtual_center_abs}, Range={self.virtual_range}"
+                    )
+                else:
+                    print(f"Invalid data found in {filename}")
+            except Exception as e:
+                messagebox.showerror(
+                    "Load Error",
+                    f"Failed to load virtual limits from {filename}: {str(e)}",
+                )
+                print(f"Failed to load virtual limits: {e}")
+
+        if not limits_loaded:
+            print(
+                f"Virtual limits file ({filename}) not found or invalid. Limits inactive."
+            )
+            self.software_limits_active = False
+            self.virtual_center_abs = None
+            self.virtual_range = None
+            self.virtual_neg_limit_abs = None
+            self.virtual_pos_limit_abs = None
+
+        self.update_limit_labels()
+
+    def update_limit_labels(self):
+        """Updates the Neg/Pos Limit labels based on whether virtual limits are active."""
+        if self.software_limits_active and self.virtual_neg_limit_abs is not None:
+            self.neg_limit_var.set(f"{self.virtual_neg_limit_abs:.3f} (Virtual)")
+            self.pos_limit_var.set(f"{self.virtual_pos_limit_abs:.3f} (Virtual)")
+        elif self.controller:
             try:
                 neg_limit = float(
                     self.controller.execute_command(
                         SMC100Command.SET_NEGATIVE_SOFTWARE_LIMIT, query=True
                     )
                 )
-                self.neg_limit_var.set(f"{neg_limit:.3f} mm")
-            except:
-                pass
-
-            try:
                 pos_limit = float(
                     self.controller.execute_command(
                         SMC100Command.SET_POSITIVE_SOFTWARE_LIMIT, query=True
                     )
                 )
-                self.pos_limit_var.set(f"{pos_limit:.3f} mm")
-            except:
-                pass
+                self.neg_limit_var.set(f"{neg_limit:.3f} (Ctrlr)")
+                self.pos_limit_var.set(f"{pos_limit:.3f} (Ctrlr)")
+            except Exception:
+                self.neg_limit_var.set("N/A (Ctrlr)")
+                self.pos_limit_var.set("N/A (Ctrlr)")
+        else:
+            self.neg_limit_var.set("N/A")
+            self.pos_limit_var.set("N/A")
+
+    def set_and_save_virtual_limits(self):
+        """Callback function to set internal limits from GUI vars and save."""
+        try:
+            center = self.virtual_center_var.get()
+            range_val = self.virtual_range_var.get()
+
+            if range_val <= 0:
+                messagebox.showerror("Input Error", "Virtual range must be positive.")
+                return
+
+            # Update internal state
+            self.virtual_center_abs = center
+            self.virtual_range = range_val
+            self.virtual_neg_limit_abs = self.virtual_center_abs - self.virtual_range
+            self.virtual_pos_limit_abs = self.virtual_center_abs + self.virtual_range
+            self.software_limits_active = True  # Activate them when set manually
+
+            self.update_limit_labels()
+            self.save_virtual_limits()  # Save the newly set limits
+            messagebox.showinfo("Success", "Virtual limits set and saved.")
+            print(
+                f"Virtual limits activated: {self.virtual_neg_limit_abs:.3f} to {self.virtual_pos_limit_abs:.3f}"
+            )
+
+        except tk.TclError:
+            messagebox.showerror(
+                "Input Error", "Invalid numeric value for virtual center or range."
+            )
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to set virtual limits: {str(e)}")
+            print(f"Failed to set virtual limits: {e}")
+
+    def is_within_virtual_limits(self, target_abs_position: float) -> bool:
+        """Checks if a target absolute position is within defined virtual limits."""
+        if not self.software_limits_active or self.virtual_neg_limit_abs is None:
+            return True 
+
+        allowed = (
+            self.virtual_neg_limit_abs
+            <= target_abs_position
+            <= self.virtual_pos_limit_abs
+        )
+        if not allowed:
+            print(
+                f"Move denied: Target {target_abs_position:.3f}mm outside virtual limits [{self.virtual_neg_limit_abs:.3f}, {self.virtual_pos_limit_abs:.3f}]"
+            )
+            messagebox.showwarning(
+                "Limit Warning",
+                f"Target position {target_abs_position:.3f}mm is outside the virtual limits [{self.virtual_neg_limit_abs:.3f}, {self.virtual_pos_limit_abs:.3f}]",
+            )
+        return allowed
+
+    def toggle_connection(self):
+        """Connect or disconnect the controller."""
+        if not self.connected:
+            threading.Thread(target=self.connect, daemon=True).start()
+        else:
+            self.disconnect()
+
+    def connect(self):
+        """Establish connection and initialize the controller."""
+        try:
+            port = self.port_var.get()
+            smc_id = int(self.smc_id_var.get())
+            print(f"Attempting connection to SMC ID {smc_id} on {port}...")
+            self.status_var.set(f"Connecting to {port}...")
+            self.root.update()
+            if self.controller:
+                self.controller.close()
+                self.controller = None
+
+            self.controller = SMC100(smcID=smc_id, port=port, silent=False)
+            print("Controller object created.")
+
+            self.status_var.set("Performing initial hardware home...")
+            self.root.update()
+            move_to_origin = self.move_to_origin_var.get()
+            home_mode = self.home_type_var.get().split(" ")[0]
+            if move_to_origin:
+                home_mode = 4
+                self.status_var.set("Moving to origin...")
+
+            else:
+                home_mode = 1  
+                print("Move to origin not requested or already connected.")
+            self.initialize_stage(
+                move_to_origin, home_mode
+            ) 
+
+            pos = self.controller.get_position_mm()
+            self.position_var.set(f"{pos:.3f} mm (Abs)") 
+            print("Initial homing complete.")
 
             self.connected = True
-            self.connect_btn.config(text="Disconnect")
-            self.jog_neg_btn.config(state="normal")
-            self.jog_pos_btn.config(state="normal")
-            self.stop_btn.config(state="normal")
-            self.set_neg_btn.config(state="normal")
-            self.set_pos_btn.config(state="normal")
-            self.apply_temp_btn.config(state="normal")
-            self.apply_perm_btn.config(state="normal")
-            self.step_neg_btn.config(state="normal")
-            self.step_pos_btn.config(state="normal")
-            self.set_home_type_btn.config(state="normal")
-            self.execute_home_btn.config(state="normal")
-            self.reset_config_btn.config(state="normal")
-            self.save_config_btn.config(state="normal")
-            self.load_config_btn.config(state="normal")
-            self.vacuum_config_btn.config(state="normal")
+            self._set_ui_state(True)
+            self.status_var.set("Connected & Ready")
+
+            self.load_virtual_limits()
+
+
             self.stop_thread = False
             self.update_thread = threading.Thread(
                 target=self.update_position_loop, daemon=True
             )
             self.update_thread.start()
+            print("Connection successful. Status updates started.")
 
+        except (
+            SMC100CommunicationError,
+            SMC100StateError,
+            SMC100TimeoutError,
+            serial.SerialException,
+            ValueError,
+            RuntimeError,
+        ) as e:
+            error_msg = f"Failed to connect/init: {str(e)}"
+            print(f"ERROR: {error_msg}")
+            messagebox.showerror("Connection Error", error_msg)
+            if self.controller:
+                self.controller.close()
+                self.controller = None
+            self.status_var.set("Connection Failed")
+            self._set_ui_state(False)  # Ensure UI is disabled
+            self.update_limit_labels()  
         except Exception as e:
-            messagebox.showerror("Connection Error", f"Failed to connect: {str(e)}")
+            error_msg = f"An unexpected error occurred: {str(e)}"
+            print(f"ERROR: {error_msg}")
+            messagebox.showerror("Error", error_msg)
+            if self.controller:
+                self.controller.close()
+                self.controller = None
+            self.status_var.set("Error")
+            self._set_ui_state(False)
+            self.update_limit_labels()
 
     def disconnect(self):
+        """Disconnect the controller and clean up."""
+        print("Disconnecting...")
         self.stop_thread = True
-        if self.update_thread:
-            self.update_thread.join(timeout=1.0)
+        if self.update_thread and self.update_thread.is_alive():
+            try:
+                self.update_thread.join(timeout=1.0)
+            except Exception as e:
+                print(f"Error joining update thread: {e}")
+        self.update_thread = None
 
         if self.controller:
+            try:
+                # Attempt to stop motion before closing, ignore errors
+                self.controller.execute_command(SMC100Command.STOP_MOTION)
+            except Exception:
+                pass
             self.controller.close()
             self.controller = None
+            print("Controller closed.")
 
         self.connected = False
-        self.connect_btn.config(text="Connect")
-        self.position_var.set("Not connected")
-        self.status_var.set("Not connected")
-        self.jog_neg_btn.config(state="disabled")
-        self.jog_pos_btn.config(state="disabled")
-        self.stop_btn.config(state="disabled")
-        self.set_neg_btn.config(state="disabled")
-        self.set_pos_btn.config(state="disabled")
-        self.apply_temp_btn.config(state="disabled")
-        self.apply_perm_btn.config(state="disabled")
-        self.step_neg_btn.config(state="disabled")
-        self.step_pos_btn.config(state="disabled")
-        self.set_home_type_btn.config(state="disabled")
-        self.execute_home_btn.config(state="disabled")
-        self.reset_config_btn.config(state="disabled")
-        self.save_config_btn.config(state="disabled")
-        self.load_config_btn.config(state="disabled")
-        self.vacuum_config_btn.config(state="disabled")
+        self._set_ui_state(False)  # Disable UI elements
+
+        self.position_var.set("N/A")
+        self.status_var.set("Not Connected")
+        self.software_limits_active = False  # Deactivate virtual limits
+        self.update_limit_labels()  # Update labels to show N/A
+        print("Disconnected.")
 
     def update_position_loop(self):
+        """Periodically query position and status in a background thread."""
+        polling_interval = 0.2 
+        print(f"Starting status polling loop (Interval: {polling_interval}s)")
         while not self.stop_thread:
+            start_time = time.monotonic()
             try:
-                pos = self.controller.get_position_mm()
-                errors, state = self.controller.get_status(silent=True)
-
-                self.root.after(0, lambda p=pos, s=state: self.update_ui(p, s))
-
-                time.sleep(0.1)
-            except Exception as e:
-                error = str(e)
-                print(f"Error in update thread: {error}")
-                self.root.after(0, lambda: self.status_var.set(f"Error: {error}"))
+                if self.controller and self.connected:
+                    pos = self.controller.get_position_mm()
+                    errors, state = self.controller.get_status(
+                        silent=True
+                    )  
+                    self.root.after(
+                        0, lambda p=pos, s=state, err=errors: self.update_ui(p, s, err)
+                    )
+                else:
+                    break
+            except (
+                SMC100CommunicationError,
+                SMC100StateError,
+                SMC100TimeoutError,
+                serial.SerialException,
+            ) as e:
+                error_msg = f"Error in update thread: {type(e).__name__}"
+                print(f"ERROR: {error_msg}")
+                
+                self.root.after(0, lambda msg=error_msg: self.status_var.set(msg))
+                
                 time.sleep(1.0)
+                
+            except Exception as e:
+                error_msg = f"Unexpected error in update thread: {e}"
+                print(f"ERROR: {error_msg}")
+                self.root.after(
+                    0, lambda msg=error_msg: self.status_var.set("Update Error")
+                )
+                time.sleep(1.0)  # Pause longer
 
-    def update_ui(self, position, state):
-        self.position_var.set(f"{position:.3f} mm")
+            elapsed = time.monotonic() - start_time
+            sleep_time = max(0, polling_interval - elapsed)
+            if self.stop_thread:
+                break  
+            time.sleep(sleep_time)
+        print("Status polling loop stopped.")
+
+    def update_ui(self, position, state_code, error_code):
+        """Update GUI labels from the main thread."""
+        if not self.connected:  
+            return
+
+        pos_unit = (
+            "mm (Abs)" if not self.software_limits_active else "mm"
+        ) 
+        self.position_var.set(f"{position:.3f} {pos_unit}")
 
         state_descriptions = {
             "0A": "NOT REFERENCED from reset",
             "0B": "NOT REFERENCED from HOMING",
-            "0C": "NOT REFERENCED from CONFIGURATION",
+            "0C": "NOT REFERENCED from CONFIG",
             "0D": "NOT REFERENCED from DISABLE",
             "0E": "NOT REFERENCED from READY",
             "0F": "NOT REFERENCED from MOVING",
+            "10": "NOT REFERENCED ESP error",
+            "11": "NOT REFERENCED from JOGGING",
             "14": "CONFIGURATION",
-            "1E": "HOMING",
+            "1E": "HOMING (CMD)",
+            "1F": "HOMING (Keypad)",
             "28": "MOVING",
             "32": "READY from HOMING",
             "33": "READY from MOVING",
             "34": "READY from DISABLE",
+            "35": "READY from JOGGING",
             "3C": "DISABLE from READY",
             "3D": "DISABLE from MOVING",
+            "3E": "DISABLE from JOGGING",
+            "46": "JOGGING from READY",
+            "47": "JOGGING from DISABLE",
         }
+        state_text = state_descriptions.get(state_code, f"Unknown ({state_code})")
 
-        state_text = state_descriptions.get(state, f"Unknown state: {state}")
+        if error_code != 0:
+            state_text += f" ERR:0x{error_code:04X}"
+
         self.status_var.set(state_text)
+
+    def execute_home(self):
+        """Execute the currently configured controller homing sequence."""
+        if not self.controller:
+            return
+        print("Executing hardware home...")
+        try:
+            errors, state = self.controller.get_status(silent=True)
+
+            if not state.startswith("0"):
+                messagebox.showwarning(
+                    "Homing", "Stage must be in a 'NOT REFERENCED' state to home."
+                )
+                print(f"Homing denied. Current state: {state}")
+
+                return
+
+            ht = self.home_type_var.get().split(" ")[0]
+            print(
+                f"Sending OR command (Controller should use its configured HT={ht})..."
+            )
+            self.status_var.set(f"Homing (HT={ht})...")
+
+            self.controller.home(wait=True)
+
+            pos = self.controller.get_position_mm()
+            self.position_var.set(f"{pos:.3f} mm (Abs)")
+            self.status_var.set("Homing Complete")
+            print("Homing complete.")
+            messagebox.showinfo("Home", "Controller Homing Sequence Executed.")
+
+        except Exception as e:
+            messagebox.showerror("Homing Error", f"Failed to execute home: {str(e)}")
+            print(f"Homing error: {e}")
+            self.status_var.set("Homing Failed")
+
+    def set_home_type(self):
+        """Set the controller's homing type (HT command). Requires Config mode."""
+        if not self.controller:
+            return
+        try:
+            home_type = int(self.home_type_var.get().split(" ")[0]) 
+            print(f"Setting controller Home Type (HT) to {home_type}...")
+
+            self.status_var.set(f"Setting HT={home_type}...")
+            self.controller.execute_command(SMC100Command.ENTER_CONFIGURATION, 1)
+            self.controller.execute_command(SMC100Command.HOME_SEARCH_TYPE, home_type)
+            self.controller.execute_command(SMC100Command.ENTER_CONFIGURATION, 0)
+            time.sleep(1.0)  # Small delay
+
+            # current_ht = int(self.controller.execute_command(SMC100Command.HOME_SEARCH_TYPE, query=True))
+            # print(f"Verified HT is now {current_ht}")
+
+            self.status_var.set("Ready")
+            messagebox.showinfo(
+                "Success", f"Controller Home Type (HT) set to {home_type}"
+            )
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to set home type: {str(e)}")
+            print(f"Set Home Type error: {e}")
+            self.status_var.set("Error")
+
+    def stop_motion(self):
+        """Send the STOP command to the controller."""
+        if not self.controller or not self.connected:
+            print("Cannot stop: Not connected.")
+            return
+        print("Sending STOP command...")
+        try:
+            self.controller.execute_command(SMC100Command.STOP_MOTION)
+            print("STOP command sent.")
+        except Exception as e:
+            messagebox.showerror("Stop Error", f"Failed to send stop command: {str(e)}")
+            print(f"Stop command error: {e}")
+
+    def step_stage(self, direction: int) -> None:
+        """Move the stage by the defined step distance, checking virtual limits."""
+        if not self.controller or not self.connected:
+            return
+        print(f"Initiating step: Direction={direction}")
+        try:
+            current_pos_abs = self.controller.get_position_mm()
+            step_dist = direction * self.move_distance_var.get()
+            target_pos_abs = current_pos_abs + step_dist
+
+            if self.is_within_virtual_limits(target_pos_abs):
+                print(
+                    f"Commanding relative move by {step_dist:.3f}mm from {current_pos_abs:.3f}mm"
+                )
+                self.status_var.set("Stepping...")
+                self.controller.execute_command(
+                    SMC100Command.SET_VELOCITY, self.move_speed_var.get()
+                )
+                self.controller.move_relative_mm(step_dist, waitStop=True)
+                print("Step move complete.")
+                self.status_var.set("Ready")
+
+        except Exception as e:
+            messagebox.showerror("Step Error", f"Failed to step: {str(e)}")
+            print(f"Step error: {e}")
+            try:
+                _, state = self.controller.get_status(silent=True)
+                self.update_ui(self.controller.get_position_mm(), state, 0)
+            except Exception as e:
+                self.status_var.set(f"Error during step {e}")
+
+    def move_absolute(self):
+        """Move stage to the absolute position specified in the entry field."""
+        if not self.controller or not self.connected:
+            return
+
+        try:
+            target_abs = float(self.abs_target_entry.get())
+            print(f"Initiating absolute move to {target_abs:.3f}mm")
+
+            if self.is_within_virtual_limits(target_abs):
+                self.status_var.set(f"Moving to {target_abs:.3f}...")
+                self.controller.execute_command(
+                    SMC100Command.SET_VELOCITY, self.move_speed_var.get()
+                )
+                self.controller.move_absolute_mm(target_abs, wait=False)
+                print(f"Absolute move to {target_abs:.3f} commanded.")
+
+        except ValueError:
+            messagebox.showerror("Input Error", "Invalid target position entered.")
+            print("Invalid absolute target value.")
+        except Exception as e:
+            messagebox.showerror("Move Error", f"Failed absolute move: {str(e)}")
+            print(f"Absolute move error: {e}")
+            self.status_var.set("Move Error")
 
     def reset_to_defaults(self):
         """Reset the controller to factory defaults and reload stage parameters."""
         if not self.controller:
             return
+        print("Resetting controller to defaults...")
         try:
             if messagebox.askyesno(
                 "Reset Configuration",
                 "This will reset all controller settings to factory defaults.\n\n"
                 "CAUTION: Stage will move during initialization.\n\n"
                 "Continue?",
+                icon=messagebox.WARNING,
             ):
-
                 self.status_var.set("Resetting controller...")
-
+                self.root.update()
                 self.controller.execute_command(SMC100Command.RESET)
-
+                print("Reset command sent. Waiting...")
                 time.sleep(3)
 
+                print("Re-initializing stage after reset...")
                 self.initialize_stage()
 
                 pos = self.controller.get_position_mm()
-                self.position_var.set(f"{pos:.3f} mm")
+                self.position_var.set(f"{pos:.3f} mm (Abs)")
+                print("Reset and initialization complete.")
 
-                try:
-                    neg_limit = float(
-                        self.controller.execute_command(
-                            SMC100Command.SET_NEGATIVE_SOFTWARE_LIMIT, query=True
-                        )
-                    )
-                    self.neg_limit_var.set(f"{neg_limit:.3f} mm")
-
-                    pos_limit = float(
-                        self.controller.execute_command(
-                            SMC100Command.SET_POSITIVE_SOFTWARE_LIMIT, query=True
-                        )
-                    )
-                    self.pos_limit_var.set(f"{pos_limit:.3f} mm")
-                except:
-                    self.neg_limit_var.set("Not set")
-                    self.pos_limit_var.set("Not set")
+                self.software_limits_active = False
+                self.load_virtual_limits()
+                self.update_limit_labels()
 
                 messagebox.showinfo(
                     "Reset Complete",
-                    "Controller has been reset and stage parameters reloaded.",
+                    "Controller has been reset and stage re-initialized.",
                 )
+            else:
+                print("Reset cancelled by user.")
 
         except Exception as e:
             messagebox.showerror("Reset Error", f"Failed to reset controller: {str(e)}")
-            self.status_var.set("Reset failed")
+            print(f"Reset error: {e}")
+            self.status_var.set("Reset Failed")
 
     def save_configuration(self):
-        """Save current controller configuration to a JSON file."""
+        """Save current CONTROLLER configuration (SL, SR, VA, AC, HT) to a JSON file."""
         if not self.controller:
             return
+        print("Saving controller configuration...")
         try:
             config_dict = {}
-
             commands_to_query = [
                 (SMC100Command.SET_NEGATIVE_SOFTWARE_LIMIT, "SL", float),
                 (SMC100Command.SET_POSITIVE_SOFTWARE_LIMIT, "SR", float),
@@ -573,46 +953,58 @@ class LimitFinderApp:
                 (SMC100Command.SET_ACCELERATION, "AC", float),
                 (SMC100Command.HOME_SEARCH_TYPE, "HT", int),
             ]
-
+            print("Querying controller parameters...")
             for cmd_enum, cmd_key, value_type in commands_to_query:
                 try:
-                    value = self.controller.execute_command(cmd_enum, query=True)
-                    if value is not None:
-                        config_dict[cmd_key] = value_type(value)
+                    value_str = self.controller.execute_command(cmd_enum, query=True)
+                    if value_str is not None:
+                        config_dict[cmd_key] = value_type(value_str)
+                        print(f"  {cmd_key}: {config_dict[cmd_key]}")
+                    else:
+                        print(f"  {cmd_key}: Query returned None")
                 except Exception as e:
-                    print(f"Error querying {cmd_key}: {str(e)}")
+                    print(f"  Error querying {cmd_key}: {str(e)}")
 
             try:
-                config_dict["ID"] = self.controller.execute_command(
+                id_val = self.controller.execute_command(
                     SMC100Command.GET_IDENTIFIER, query=True
                 )
-            except:
-                pass
+                config_dict["ID"] = id_val
+                print(f"  ID: {id_val}")
+            except Exception as e:
+                print(f"  Error querying ID: {str(e)}")
 
             file_path = filedialog.asksaveasfilename(
                 defaultextension=".json",
                 filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
                 title="Save Controller Configuration",
+                initialfile="smc100_config.json",
             )
 
             if not file_path:
+                print("Save configuration cancelled.")
                 return
 
             with open(file_path, "w") as f:
                 json.dump(config_dict, f, indent=4)
 
-            messagebox.showinfo("Success", f"Configuration saved to {file_path}")
+            print(f"Controller configuration saved to {file_path}")
+            messagebox.showinfo(
+                "Success",
+                f"Controller configuration saved to {os.path.basename(file_path)}",
+            )
 
         except Exception as e:
             messagebox.showerror(
-                "Save Error", f"Failed to save configuration: {str(e)}"
+                "Save Error", f"Failed to save controller configuration: {str(e)}"
             )
+            print(f"Save configuration error: {e}")
 
     def load_configuration(self):
-        """Load controller configuration from a JSON file."""
+        """Load CONTROLLER configuration (SL, SR, VA, AC, HT) from JSON and apply."""
         if not self.controller:
             return
-
+        print("Loading controller configuration...")
         try:
             file_path = filedialog.askopenfilename(
                 defaultextension=".json",
@@ -621,19 +1013,24 @@ class LimitFinderApp:
             )
 
             if not file_path:
+                print("Load configuration cancelled.")
                 return
 
             with open(file_path, "r") as f:
                 config_dict = json.load(f)
 
-            if not config_dict:
-                messagebox.showerror("Error", "Configuration file is empty or invalid")
+            if not isinstance(config_dict, dict) or not config_dict:
+                messagebox.showerror("Error", "Configuration file is empty or invalid.")
                 return
 
             if not messagebox.askyesno(
                 "Confirm Load",
-                "This will overwrite current controller settings.\n\n" "Continue?",
+                "This will overwrite current controller settings.\n\n"
+                "These settings will be saved permanently.\n\n"
+                "Continue?",
+                icon=messagebox.WARNING,
             ):
+                print("Load configuration aborted by user.")
                 return
 
             command_map = {
@@ -645,539 +1042,245 @@ class LimitFinderApp:
             }
 
             self.status_var.set("Loading configuration...")
-            need_config_mode = any(
-                key in ["SL", "SR", "HT"] for key in config_dict.keys()
-            )
+            self.root.update()
+            print("Applying configuration to controller...")
 
-            if need_config_mode:
-                self.controller.execute_command(SMC100Command.ENTER_CONFIGURATION, 1)
+            self.controller.execute_command(SMC100Command.ENTER_CONFIGURATION, 1)
+            print("  Entered configuration mode.")
 
-            for cmd_key, value in config_dict.items():
-                try:
-                    if cmd_key in command_map:
-                        self.controller.execute_command(command_map[cmd_key], value)
-                except Exception as e:
-                    print(f"Error setting {cmd_key}: {str(e)}")
+            config_mode_keys = ["SL", "SR", "HT"]
+            for key in config_mode_keys:
+                if key in config_dict:
+                    try:
+                        value = config_dict[key]
+                        self.controller.execute_command(command_map[key], value)
+                        print(f"  Set {key} = {value}")
+                    except Exception as e:
+                        print(f"  Error setting {key}: {str(e)}")
 
-            if need_config_mode:
-                self.controller.execute_command(SMC100Command.ENTER_CONFIGURATION, 0)
+            self.controller.execute_command(SMC100Command.ENTER_CONFIGURATION, 0)
+            print("  Exited configuration mode (Saved SL, SR, HT).")
 
-            self.status_var.set("Configuration loaded")
+            non_config_keys = ["VA", "AC"]
+            for key in non_config_keys:
+                if key in config_dict:
+                    try:
+                        value = config_dict[key]
+                        self.controller.execute_command(command_map[key], value)
+                        print(f"  Set {key} = {value} (temporary)")
+                        # Note: VA/AC set outside config mode are temporary unless saved again later
+                    except Exception as e:
+                        print(f"  Error setting {key}: {str(e)}")
+
+            self.status_var.set("Configuration Loaded")
+            print("Configuration loaded successfully.")
             messagebox.showinfo(
-                "Success", "Configuration loaded and applied to controller"
+                "Success", "Configuration loaded and applied to controller."
             )
 
-            try:
-                neg_limit = float(
-                    self.controller.execute_command(
-                        SMC100Command.SET_NEGATIVE_SOFTWARE_LIMIT, query=True
-                    )
-                )
-                self.neg_limit_var.set(f"{neg_limit:.3f} mm")
+            self.update_limit_labels()
 
-                pos_limit = float(
-                    self.controller.execute_command(
-                        SMC100Command.SET_POSITIVE_SOFTWARE_LIMIT, query=True
-                    )
-                )
-                self.pos_limit_var.set(f"{pos_limit:.3f} mm")
-            except:
-                pass
-
+        except FileNotFoundError:
+            messagebox.showerror("Load Error", f"File not found: {file_path}")
+            print(f"Load error: File not found {file_path}")
+        except json.JSONDecodeError:
+            messagebox.showerror(
+                "Load Error",
+                f"Invalid JSON format in file: {os.path.basename(file_path)}",
+            )
+            print(f"Load error: Invalid JSON in {file_path}")
         except Exception as e:
             messagebox.showerror(
                 "Load Error", f"Failed to load configuration: {str(e)}"
             )
-            self.status_var.set("Load failed")
+            print(f"Load configuration error: {e}")
+            self.status_var.set("Load Failed")
+            # Attempt to exit config mode if stuck
             try:
                 self.controller.execute_command(SMC100Command.ENTER_CONFIGURATION, 0)
-            except:
+            except Exception:
                 pass
 
-    def on_jog_press(self, direction):
-        if not self.controller:
-            return
-        self.jogging = True
-        threading.Thread(
-            target=self._continuous_jog, args=(direction,), daemon=True
-        ).start()
-
-    def on_jog_release(self):
-        self.jogging = False
-        try:
-            self.controller.execute_command(SMC100Command.STOP_MOTION)
-        except:
-            pass
-
-    def _continuous_jog(self, direction):
-        velocity = self.jog_speed.get()
-        self.controller.execute_command(SMC100Command.SET_VELOCITY, velocity)
-
-        interval = 0.05  # 50 ms per update
-        step = direction * velocity * interval
-
-        while self.jogging:
-            try:
-                self.controller.execute_command(SMC100Command.MOVE_RELATIVE, step)
-            except Exception:
-                break
-            time.sleep(interval)
-
-    def jog_stage(self, direction):
-        if not self.controller:
-            return
-
-        try:
-            self.controller.execute_command(
-                SMC100Command.SET_VELOCITY, self.jog_speed.get()
-            )
-
-            distance = direction * self.jog_distance.get()
-
-            self.controller.move_relative_mm(distance, waitStop=False)
-
-        except Exception as e:
-            messagebox.showerror("Movement Error", f"Failed to jog: {str(e)}")
-
-    def step_stage(self, direction: int) -> None:
-        """
-        Move by one step (self.jog_distance) and wait for it to finish.
-        direction: +1 or -1
-        """
-        if not self.controller:
-            return
-        try:
-            self.controller.execute_command(
-                SMC100Command.SET_VELOCITY, self.jog_speed.get()
-            )
-            self.controller.move_relative_mm(
-                direction * self.jog_distance.get(), waitStop=True
-            )
-        except Exception as e:
-            messagebox.showerror("Step Error", f"Failed to step: {e}")
-
-    def stop_motion(self):
-        if not self.controller:
-            return
-
-        try:
-            self.controller.execute_command(SMC100Command.STOP_MOTION)
-        except Exception as e:
-            messagebox.showerror("Stop Error", f"Failed to stop motion: {str(e)}")
-
-    def set_negative_limit(self):
-        if not self.controller:
-            return
-
-        try:
-            pos = self.controller.get_position_mm()
-            self.neg_limit_var.set(f"{pos:.3f} mm")
-        except Exception as e:
-            messagebox.showerror(
-                "Limit Error", f"Failed to set negative limit: {str(e)}"
-            )
-
-    def set_positive_limit(self):
-        if not self.controller:
-            return
-
-        try:
-            pos = self.controller.get_position_mm()
-            self.pos_limit_var.set(f"{pos:.3f} mm")
-        except Exception as e:
-            messagebox.showerror(
-                "Limit Error", f"Failed to set positive limit: {str(e)}"
-            )
-
-    def set_home_type(self):
-        if not self.controller:
-            return
-
-        try:
-            home_type = int(self.home_type_var.get()[0])
-
-            errors, state = self.controller.get_status(silent=True)
-
-            if state != "14":
-                self.controller.execute_command(SMC100Command.ENTER_CONFIGURATION, 1)
-
-            self.controller.execute_command(SMC100Command.HOME_SEARCH_TYPE, home_type)
-
-            if state != "14":
-                self.controller.execute_command(SMC100Command.ENTER_CONFIGURATION, 0)
-
-            messagebox.showinfo("Success", f"Home type set to {home_type}")
-
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to set home type: {str(e)}")
-
-    def execute_home(self):
-        if not self.controller:
-            return
-        try:
-            errors, state = self.controller.get_status(silent=True)
-
-            if not state.startswith("0"):
-                if messagebox.askyesno(
-                    "Reset Required",
-                    "Controller must be reset before homing. This will stop all motion. Proceed?",
-                ):
-                    self.controller.execute_command(SMC100Command.RESET)
-                    time.sleep(3)
-                else:
-                    return
-
-            self.controller.execute_command(SMC100Command.HOME)
-
-            messagebox.showinfo("Home", "Home command executed")
-
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to execute home: {str(e)}")
-
-    def apply_limits_temp(self):
-        if not self.controller:
-            return
-
-        try:
-            neg_limit = self.neg_limit_var.get()
-            pos_limit = self.pos_limit_var.get()
-
-            if neg_limit == "Not set" or pos_limit == "Not set":
-                messagebox.showwarning(
-                    "Limits Not Set", "Please set both limits first."
-                )
-                return
-
-            neg_limit = float(neg_limit.split()[0])
-            pos_limit = float(pos_limit.split()[0])
-
-            self.controller.execute_command(
-                SMC100Command.SET_NEGATIVE_SOFTWARE_LIMIT, neg_limit
-            )
-            self.controller.execute_command(
-                SMC100Command.SET_POSITIVE_SOFTWARE_LIMIT, pos_limit
-            )
-
-            messagebox.showinfo(
-                "Success",
-                "Limits applied temporarily. These will be lost after controller reset.",
-            )
-
-        except Exception as e:
-            messagebox.showerror("Limit Error", f"Failed to apply limits: {str(e)}")
-
-    def apply_limits_perm(self):
-        if not self.controller:
-            return
-
-        try:
-            neg_limit = self.neg_limit_var.get()
-            pos_limit = self.pos_limit_var.get()
-
-            if neg_limit == "Not set" or pos_limit == "Not set":
-                messagebox.showwarning(
-                    "Limits Not Set", "Please set both limits first."
-                )
-                return
-
-            neg_limit = float(neg_limit.split()[0])
-            pos_limit = float(pos_limit.split()[0])
-
-            self.controller.execute_command(SMC100Command.ENTER_CONFIGURATION, 1)
-
-            self.controller.execute_command(
-                SMC100Command.SET_NEGATIVE_SOFTWARE_LIMIT, neg_limit
-            )
-            self.controller.execute_command(
-                SMC100Command.SET_POSITIVE_SOFTWARE_LIMIT, pos_limit
-            )
-
-            self.controller.execute_command(SMC100Command.ENTER_CONFIGURATION, 0)
-
-            messagebox.showinfo(
-                "Success", "Limits saved permanently to controller memory."
-            )
-
-        except Exception as e:
-            messagebox.showerror("Limit Error", f"Failed to save limits: {str(e)}")
-
     def configure_for_vacuum_chamber(self):
-        """
-        Configure the stage for safe operation in a vacuum chamber with fragile samples.
-        This implementation uses ONLY position-based homing and tight travel limits.
-        """
-        if not self.controller:
+        """Configure stage for vacuum use: Hardware home, center at 12.5mm, set virtual limits."""
+        if not self.controller or not self.connected:
+            messagebox.showerror("Error", "Controller not connected.")
             return
+
+        print("Starting vacuum chamber configuration process...")
+        if not messagebox.askyesno(
+            "⚠️ Vacuum Setup Confirmation ⚠️",
+            "This process will:\n\n"
+            "1. Perform a hardware home (stage will move).\n"
+            "2. Move the stage to absolute 12.5 mm.\n"
+            "3. Activate virtual limits +/- 1.0 mm around 12.5 mm.\n"
+            "4. Save these virtual limits to 'virtual_limits_config.json'.\n"
+            "5. Set wide controller limits (e.g., 0-25mm) permanently.\n\n"
+            "Ensure stage path is clear. Continue?",
+            icon=messagebox.WARNING,
+        ):
+            print("Vacuum configuration cancelled by user.")
+            return
+
         try:
-            if not messagebox.askyesno(
-                "⚠️ VACUUM CONFIGURATION ⚠️",
-                "This function will:\n\n"
-                "1. Find hardware home reference (requires movement)\n"
-                "2. Move to exactly 12.5mm position\n"
-                "3. Set this position as new zero (WILL EXECUTE HOME ONCE)\n"
-                "4. Set limits to ±1.0mm (creating 11.5-13.5mm physical range)\n\n"
-                "Continue?",
-                icon=messagebox.WARNING,
-            ):
+            self.status_var.set("Starting Vacuum Config...")
+            self.root.update()
+
+            print("Step 1: Performing hardware home...")
+
+            current_ht = int(
+                self.controller.execute_command(
+                    SMC100Command.HOME_SEARCH_TYPE, query=True
+                )
+            )
+            print(f"  Using controller's current Home Type: HT={current_ht}")
+            if current_ht not in [0, 2, 3, 4]:
+                messagebox.showerror(
+                    "Error",
+                    f"Unsupported Home Type {current_ht} set on controller. Please set HT 0, 2, 3, or 4 first.",
+                )
                 return
 
-            self.status_var.set("Configuring for vacuum chamber...")
+            self.status_var.set(f"Hardware Homing (HT={current_ht})...")
+            self.controller.home(wait=True)
+            initial_pos = self.controller.get_position_mm()
+            self.status_var.set(f"Home complete (Pos: {initial_pos:.3f})")
+            print(f"  Hardware home complete. Position is ~{initial_pos:.3f} mm.")
+            if abs(initial_pos) > 0.01:
+                print(
+                    f"WARNING: Position after home is not zero ({initial_pos:.3f}). Proceeding cautiously."
+                )
 
-            # STEP 1: Hardware homing to establish absolute reference
-            ref_type = messagebox.askyesno(
-                "Hardware Reference",
-                "Which hardware reference method do you want to use?\n\n"
-                "YES = End-of-Run with encoder index (HT=3)\n"
-                "NO = End-of-Run switch only (HT=4)",
+            target_center_abs = 12.5
+            print(f"Step 2: Moving to absolute center {target_center_abs} mm...")
+            self.status_var.set(f"Moving to {target_center_abs} mm...")
+            self.controller.execute_command(
+                SMC100Command.SET_VELOCITY, self.move_speed_var.get()
+            )
+            self.controller.move_absolute_mm(target_center_abs, wait=True)
+
+            pos = self.controller.get_position_mm()
+            print(f"  Position after move: {pos:.5f} mm")
+            if abs(pos - target_center_abs) > 0.01:
+                raise RuntimeError(
+                    f"Failed verification: Stage did not reach {target_center_abs}mm (at {pos:.3f}mm)"
+                )
+            self.status_var.set(f"Centered at {pos:.3f} mm")
+            print(f"  Successfully centered at {pos:.3f} mm.")
+
+            print("Step 3: Setting and saving virtual limits...")
+            self.virtual_center_abs = pos  # Use actual reached position
+            self.virtual_range = 1.0  # Desired range
+            self.virtual_neg_limit_abs = self.virtual_center_abs - self.virtual_range
+            self.virtual_pos_limit_abs = self.virtual_center_abs + self.virtual_range
+            self.software_limits_active = True
+            self.virtual_center_var.set(self.virtual_center_abs)
+            self.virtual_range_var.set(self.virtual_range)
+            self.update_limit_labels()
+            self.save_virtual_limits()
+            print(
+                f"  Virtual limits active and saved: {self.virtual_neg_limit_abs:.3f} to {self.virtual_pos_limit_abs:.3f}"
             )
 
-            home_type = 3 if ref_type else 4
+            wide_neg_limit = 0.0
 
-            # Configure for hardware homing
+            wide_pos_limit = 25.0
+
+            print(
+                f"Step 4: Setting wide controller limits SL={wide_neg_limit}, SR={wide_pos_limit} permanently..."
+            )
+            self.status_var.set("Saving final config...")
+            self.controller.execute_command(SMC100Command.ENTER_CONFIGURATION, 1)
+            self.controller.execute_command(
+                SMC100Command.SET_NEGATIVE_SOFTWARE_LIMIT, wide_neg_limit
+            )
+            self.controller.execute_command(
+                SMC100Command.SET_POSITIVE_SOFTWARE_LIMIT, wide_pos_limit
+            )
+            self.controller.execute_command(SMC100Command.HOME_SEARCH_TYPE, current_ht)
+            self.controller.execute_command(SMC100Command.ENTER_CONFIGURATION, 0)
+            print("  Wide controller limits and default HT saved.")
+
+            current_pos = self.controller.get_position_mm()
+            self.position_var.set(f"{current_pos:.3f} mm (Abs)")
+            self.update_limit_labels()
+            self.status_var.set("Vacuum Config Complete (Virtual Limits Active)")
+            print("Vacuum configuration process finished.")
+
+            messagebox.showinfo(
+                "✓ Vacuum Setup Complete",
+                f"Stage configured for vacuum use:\n\n"
+                f"• Stage centered at absolute {current_pos:.3f}mm.\n"
+                f"• Virtual limits activated: {self.virtual_neg_limit_abs:.3f} mm to {self.virtual_pos_limit_abs:.3f} mm.\n"
+                f"• Virtual limits saved to '{self.virtual_config_file}'.\n"
+                f"• Controller limits set wide ({wide_neg_limit:.1f} to {wide_pos_limit:.1f} mm).\n"
+                f"• Default Home Type set to HT={current_ht}.\n\n"
+                f"⚠️ Movement restricted by SOFTWARE.",
+                parent=self.root,
+            )
+
+        except Exception as e:
+            error_msg = f"Vacuum configuration failed: {str(e)}"
+            messagebox.showerror("Configuration Error", error_msg)
+            print(f"ERROR: {error_msg}")
+            self.status_var.set("Vacuum Config Failed")
+            self.software_limits_active = False
+            self.update_limit_labels()
+
+    def initialize_stage(
+        self, move_to_origin: bool = False, home_type: int = 3
+    ) -> None:
+        """Initialize stage on connection: Set default HT, Home."""
+        if not self.controller:
+            return
+        print("Initializing stage...")
+        try:
+            for _ in range(2):  # Try twice
+                errors, state = self.controller.get_status(silent=True)
+                if state == "14":
+                    print("  Controller was in config mode, exiting...")
+                    self.controller.execute_command(
+                        SMC100Command.ENTER_CONFIGURATION, 0
+                    )
+                    time.sleep(1)  # Give time to exit
+                else:
+                    break
+            else:
+                raise RuntimeError("Controller stuck in config mode.")
+
+            print(f"  Setting default Home Type to HT={home_type}...")
             self.controller.execute_command(SMC100Command.ENTER_CONFIGURATION, 1)
             self.controller.execute_command(SMC100Command.HOME_SEARCH_TYPE, home_type)
             self.controller.execute_command(SMC100Command.ENTER_CONFIGURATION, 0)
+            self.home_type_var.set(
+                f"{home_type} - {dict(enumerate(self.home_type_combo['values']))[home_type].split(' - ')[1]}"
+            )
+            print("  Default Home Type set.")
+            time.sleep(2.0)  # Short delay after config
 
-            start = time.time()
-            while True:
-                _, st = self.controller.get_status(silent=True)
-                if st != "14":
-                    break
-                if time.time() - start > 12:
-                    raise RuntimeError("Configuration exit timeout")
-                time.sleep(0.1)
+            print("  Performing initial hardware home...")
+            self.status_var.set(f"Homing (HT={home_type})...")
+            self.controller.home(
+                wait=True, move_to_origin=move_to_origin
+            )  # Uses the HT set above
 
-            self.status_var.set(f"Finding hardware reference (HT={home_type})...")
-            self.controller.home(wait=True)
-
-            initial_pos = self.controller.get_position_mm()
-            self.status_var.set(f"Hardware reference found at {initial_pos:.3f}mm")
-
-            # STEP 2: Move to exactly 12.5mm position
-            self.status_var.set("Moving to 12.5mm position...")
-            self.controller.move_absolute_mm(12.5)
-
-            # Verify position
             pos = self.controller.get_position_mm()
-            if abs(pos - 12.5) > 0.01:
-                raise RuntimeError(
-                    f"Failed to reach 12.5mm position (current: {pos:.3f}mm)"
-                )
-
-            # STEP 3: Now we need to redefine this position as zero
-            self.controller.execute_command(SMC100Command.ENTER_CONFIGURATION, 1)
-            self.controller.execute_command(SMC100Command.HOME_SEARCH_TYPE, 1)
-            self.controller.execute_command(SMC100Command.ENTER_CONFIGURATION, 0)
-
-            # Wait for configuration to complete
-            start = time.time()
-            while True:
-                _, st = self.controller.get_status(silent=True)
-                if st != "14":
-                    break
-                if time.time() - start > 12:
-                    raise RuntimeError("Configuration exit timeout")
-                time.sleep(0.1)
-
-            # Execute home command once (CRITICAL: this sets current position as zero)
-            self.status_var.set("Setting 12.5mm as new zero reference...")
-            self.controller.home(wait=True)
-
-            # Verify new position is zero
-            new_pos = self.controller.get_position_mm()
-            if abs(new_pos) > 0.01:
-                raise RuntimeError(
-                    f"Failed to set zero reference (position: {new_pos:.3f}mm)"
-                )
-
-            # STEP 4: Now set software limits relative to this new zero position
-            rel_neg_limit = -1.0  # 1mm in negative direction (11.5mm physical)
-            rel_pos_limit = 1.0  # 1mm in positive direction (13.5mm physical)
-
-            self.controller.execute_command(
-                SMC100Command.SET_NEGATIVE_SOFTWARE_LIMIT, rel_neg_limit
-            )
-            self.controller.execute_command(
-                SMC100Command.SET_POSITIVE_SOFTWARE_LIMIT, rel_pos_limit
-            )
-
-            # STEP 5: Save configuration permanently
-            self.controller.execute_command(SMC100Command.ENTER_CONFIGURATION, 1)
-            # HT=1 already set, just need to exit to save
-            self.controller.execute_command(SMC100Command.ENTER_CONFIGURATION, 0)
-
-            # STEP 6: Save configuration for future reference
-            config = {
-                "vacuum_config": True,
-                "prevent_rehoming": True,
-                "physical_position": 12.5,
-                "physical_range": [11.5, 13.5],
-                "HT": 1,
-                "rel_limits": [rel_neg_limit, rel_pos_limit],
-                "setup_date": time.strftime("%Y-%m-%d %H:%M:%S"),
-            }
-
-            try:
-                with open("vacuum_safety_config.json", "w") as f:
-                    json.dump(config, f, indent=4)
-            except Exception as e:
-                print(f"Failed to save config file: {e}")
-
-            # Update UI
-            pos = self.controller.get_position_mm()
-            neg_limit = float(
-                self.controller.execute_command(
-                    SMC100Command.SET_NEGATIVE_SOFTWARE_LIMIT, query=True
-                )
-            )
-            pos_limit = float(
-                self.controller.execute_command(
-                    SMC100Command.SET_POSITIVE_SOFTWARE_LIMIT, query=True
-                )
-            )
-
-            self.position_var.set(f"{pos:.3f} mm")
-            self.neg_limit_var.set(f"{neg_limit:.3f} mm")
-            self.pos_limit_var.set(f"{pos_limit:.3f} mm")
-
-            self.status_var.set("Vacuum configuration complete - DO NOT REHOME AGAIN")
-
-            messagebox.showinfo(
-                "✓ VACUUM CONFIGURATION COMPLETE",
-                f"The stage has been configured for vacuum chamber use:\n\n"
-                f"• Physical position 12.5mm is now set as 0.0mm\n"
-                f"• Travel limits: {neg_limit:.3f}mm to {pos_limit:.3f}mm\n"
-                f"• This creates a physical range of 11.5mm to 13.5mm\n"
-                f"• Position-based homing (HT=1) configured for future\n\n"
-                f"⚠️ CRITICAL: DO NOT EXECUTE ANY MORE HOME COMMANDS\n"
-                f"OR RESET THE CONTROLLER WHILE IN VACUUM CHAMBER!",
-            )
+            print(f"  Initial homing complete. Position: {pos:.3f}")
+            self.position_var.set(f"{pos:.3f} mm (Abs)")
+            self.status_var.set("Ready")
 
         except Exception as e:
-            messagebox.showerror("Configuration Error", f"Failed: {str(e)}")
-            self.status_var.set("Vacuum configuration failed")
-
-    def connect_with_rehome_prevention(self):
-        import os
-
-        """Modified connect method that prevents rehoming"""
-        try:
-            port = self.port_entry.get()
-            smc_id = int(self.smc_id_entry.get())
-            if self.controller:
-                self.controller.close()
-
-            self.controller = SMC100(smcID=smc_id, port=port, silent=False)
-
-            if os.path.exists("vacuum_safety_config.json"):
-                try:
-                    with open("vacuum_safety_config.json", "r") as f:
-                        config = json.load(f)
-
-                    if config.get("vacuum_config", False) and config.get(
-                        "prevent_rehoming", False
-                    ):
-                        self.status_var.set(
-                            "Loading vacuum configuration (no rehoming)..."
-                        )
-
-                        self.controller.execute_command(
-                            SMC100Command.ENTER_CONFIGURATION, 1
-                        )
-                        self.controller.execute_command(
-                            SMC100Command.HOME_SEARCH_TYPE, 1
-                        )
-                        self.controller.execute_command(
-                            SMC100Command.ENTER_CONFIGURATION, 0
-                        )
-
-                        start = time.time()
-                        while True:
-                            _, st = self.controller.get_status(silent=True)
-                            if st != "14":
-                                break
-                            if time.time() - start > 12:
-                                raise RuntimeError("Configuration timeout")
-                            time.sleep(0.1)
-
-                        neg_limit = config.get("SL", -1.0)
-                        pos_limit = config.get("SR", 1.0)
-                        self.controller.execute_command(
-                            SMC100Command.SET_NEGATIVE_SOFTWARE_LIMIT, neg_limit
-                        )
-                        self.controller.execute_command(
-                            SMC100Command.SET_POSITIVE_SOFTWARE_LIMIT, pos_limit
-                        )
-
-                        abs_pos = config.get("absolute_position", 12.5)
-                        phys_range = config.get(
-                            "physical_range", [abs_pos - 1.0, abs_pos + 1.0]
-                        )
-
-                        pos = self.controller.get_position_mm()
-                        self.position_var.set(f"{pos:.3f} mm")
-                        self.neg_limit_var.set(f"{neg_limit:.3f} mm")
-                        self.pos_limit_var.set(f"{pos_limit:.3f} mm")
-
-                        messagebox.showwarning(
-                            "⚠️ VACUUM CONFIGURATION ACTIVE",
-                            f"Stage is in vacuum-safe mode:\n\n"
-                            f"• Current position: {pos:.3f}mm on relative scale\n"
-                            f"• This is approximately {abs_pos+pos:.1f}mm in absolute position\n"
-                            f"• Safe travel range: {neg_limit:.1f}mm to {pos_limit:.1f}mm\n"
-                            f"  (Physical range: {phys_range[0]:.1f}mm to {phys_range[1]:.1f}mm)\n\n"
-                            f"⚠️ HOME COMMANDS DISABLED to prevent damage\n"
-                            f"⚠️ DO NOT EXECUTE HOME while in vacuum chamber",
-                        )
-
-                        self.disable_home_buttons()
-
-                        self.status_var.set(
-                            "Vacuum configuration loaded - HOME DISABLED"
-                        )
-                    else:
-                        self.initialize_stage()
-                except Exception as e:
-                    self._logger.error(f"Error loading vacuum config: {e}")
-                    self.initialize_stage()
-            else:
-                self.initialize_stage()
-
-            self.connected = True
-            self.enable_standard_buttons()
-
-            self.stop_thread = False
-            self.update_thread = threading.Thread(target=self.update_position_loop)
-            self.update_thread.daemon = True
-            self.update_thread.start()
-
-        except Exception as e:
-            messagebox.showerror("Connection Error", f"Failed to connect: {str(e)}")
-
-    def disable_home_buttons(self):
-        """Disable all home-related buttons to prevent accidental homing"""
-        for button_name in dir(self):
-            if isinstance(getattr(self, button_name, None), ttk.Button) and any(
-                x in button_name.lower() for x in ["home", "init"]
-            ):
-                button = getattr(self, button_name)
-                button.config(state="disabled")
-        try:
-            if not hasattr(self, "home_warning_label"):
-                self.home_warning_label = ttk.Label(
-                    self.root,
-                    text="⚠️ HOME COMMANDS DISABLED - VACUUM SAFETY MODE ACTIVE ⚠️",
-                    foreground="red",
-                    font=("TkDefaultFont", 12, "bold"),
-                )
-                self.home_warning_label.pack(side="top", fill="x", padx=10, pady=5)
-        except:
-            pass
+            raise RuntimeError(f"Stage initialization failed: {e}") from e
 
 
 if __name__ == "__main__":
     root = tk.Tk()
+
     app = LimitFinderApp(root)
-    root.mainloop()
-    if app.controller:
-        app.controller.close()
+
+    try:
+        root.mainloop()
+    finally:
+        if hasattr(app, "controller") and app.controller:
+            print("\nClosing controller connection...")
+            app.disconnect()
